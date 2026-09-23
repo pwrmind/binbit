@@ -1,16 +1,15 @@
 """
-multitask_experiment.py
-=======================
-Проверяем, можно ли переиспользовать фиксированный геометрический базис
-для нескольких задач одновременно.
+router_cascade.py
+=================
+Проверяем, имеет ли смысл MoE-подход поверх нашей архитектуры.
 
-Режимы:
-    1. Independent        : 3 отдельные BasisNet, обучены независимо (baseline)
-    2. Shared trunk       : общий фикс. базис + общий ствол + 3 головы
-    3. Shared basis only  : общий фикс. базис + 3 отдельных ствола + 3 головы
+Компоненты:
+    1. Три независимых эксперта (MNIST / FashionMNIST / KMNIST)
+    2. Domain router: классификатор домена на объединённом датасете
+    3. Каскад: router → соответствующий эксперт
+    4. Baseline: единая модель на 30 классах
 
-Задачи: MNIST, FashionMNIST, KMNIST. Все 28x28, 10 классов.
-15 эпох, CosineAnnealingLR, ToTensor без нормализации.
+Всё с одинаковыми гиперпараметрами: 15 эпох, Cosine, ToTensor без нормализации.
 """
 
 import warnings
@@ -20,7 +19,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torchvision import datasets, transforms
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, ConcatDataset
 import time
 
 
@@ -37,11 +36,10 @@ TEMPLATES = torch.tensor([
 
 
 # ============================================================
-# МОДЕЛИ
+# МОДЕЛЬ
 # ============================================================
 
 class BasisNet(nn.Module):
-    """Одиночная модель — для baseline."""
     def __init__(self, in_channels=1, num_classes=10):
         super().__init__()
         self.fixed_conv = nn.Conv2d(in_channels, 4, 2, stride=2, padding=0, bias=False)
@@ -63,53 +61,14 @@ class BasisNet(nn.Module):
         return self.classifier(torch.flatten(x, 1))
 
 
-class MultiTaskNet(nn.Module):
-    """
-    Общий фиксированный базис + (общий или раздельный) ствол + N голов.
-    task_id передаётся в forward, чтобы выбрать нужный ствол/голову.
-    """
-    def __init__(self, num_tasks=3, in_channels=1, num_classes=10, share_trunk=True):
-        super().__init__()
-        self.share_trunk = share_trunk
-        self.num_tasks = num_tasks
-
-        # --- Фиксированный базис (всегда общий) ---
-        self.fixed_conv = nn.Conv2d(in_channels, 4, 2, stride=2, padding=0, bias=False)
-        w = TEMPLATES.unsqueeze(1)
-        self.fixed_conv.weight = nn.Parameter(w, requires_grad=False)
-        self.act = nn.ReLU()
-
-        def make_trunk():
-            return nn.Sequential(
-                nn.Conv2d(4, 64, 3, padding=1),
-                nn.BatchNorm2d(64), nn.ReLU(), nn.MaxPool2d(2),
-                nn.Conv2d(64, 128, 3, padding=1),
-                nn.BatchNorm2d(128), nn.ReLU(), nn.MaxPool2d(2),
-                nn.AdaptiveAvgPool2d((1, 1)),
-            )
-
-        if share_trunk:
-            self.trunk = make_trunk()
-        else:
-            self.trunks = nn.ModuleList([make_trunk() for _ in range(num_tasks)])
-
-        self.heads = nn.ModuleList([nn.Linear(128, num_classes) for _ in range(num_tasks)])
-
-    def forward(self, x, task_id):
-        x = self.act(self.fixed_conv(x))
-        if self.share_trunk:
-            x = self.trunk(x)
-        else:
-            x = self.trunks[task_id](x)
-        x = torch.flatten(x, 1)
-        return self.heads[task_id](x)
-
-
 # ============================================================
 # ДАННЫЕ
 # ============================================================
 
-def get_loaders(name, batch_size=128):
+DOMAIN_NAMES = ["MNIST", "FashionMNIST", "KMNIST"]
+
+
+def get_raw_dataset(name, train):
     tf = transforms.Compose([transforms.ToTensor()])
     if name == "MNIST":
         cls, root = datasets.MNIST, "./data"
@@ -119,110 +78,115 @@ def get_loaders(name, batch_size=128):
         cls, root = datasets.KMNIST, "./data"
     else:
         raise ValueError(name)
+    return cls(root=root, train=train, download=True, transform=tf)
 
-    tr = cls(root=root, train=True,  download=True, transform=tf)
-    te = cls(root=root, train=False, download=True, transform=tf)
-    return (DataLoader(tr, batch_size=batch_size, shuffle=True,
+
+class DomainLabeled(torch.utils.data.Dataset):
+    """Обёртка, добавляющая метку домена к каждому примеру."""
+    def __init__(self, dataset, domain_id):
+        self.dataset = dataset
+        self.domain_id = domain_id
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        x, _ = self.dataset[idx]
+        return x, self.domain_id
+
+
+class GlobalLabeled(torch.utils.data.Dataset):
+    """Обёртка для единой модели: метка = domain_id * 10 + original_class."""
+    def __init__(self, dataset, domain_id):
+        self.dataset = dataset
+        self.offset = domain_id * 10
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        x, y = self.dataset[idx]
+        return x, y + self.offset
+
+
+def get_domain_loaders(batch_size=128):
+    """Объединённый датасет с метками доменов 0/1/2."""
+    train_parts = [DomainLabeled(get_raw_dataset(n, True), i)
+                   for i, n in enumerate(DOMAIN_NAMES)]
+    test_parts = [DomainLabeled(get_raw_dataset(n, False), i)
+                  for i, n in enumerate(DOMAIN_NAMES)]
+    train_ds = ConcatDataset(train_parts)
+    test_ds = ConcatDataset(test_parts)
+    return (DataLoader(train_ds, batch_size=batch_size, shuffle=True,
                        num_workers=2, pin_memory=True),
-            DataLoader(te, batch_size=1000, shuffle=False,
+            DataLoader(test_ds, batch_size=1000, shuffle=False,
+                       num_workers=2, pin_memory=True))
+
+
+def get_global_loaders(batch_size=128):
+    """Объединённый датасет с метками 0..29."""
+    train_parts = [GlobalLabeled(get_raw_dataset(n, True), i)
+                   for i, n in enumerate(DOMAIN_NAMES)]
+    test_parts = [GlobalLabeled(get_raw_dataset(n, False), i)
+                  for i, n in enumerate(DOMAIN_NAMES)]
+    train_ds = ConcatDataset(train_parts)
+    test_ds = ConcatDataset(test_parts)
+    return (DataLoader(train_ds, batch_size=batch_size, shuffle=True,
+                       num_workers=2, pin_memory=True),
+            DataLoader(test_ds, batch_size=1000, shuffle=False,
                        num_workers=2, pin_memory=True))
 
 
 # ============================================================
-# ОБУЧЕНИЕ ОДИНОЧНОЙ МОДЕЛИ (BASELINE)
+# ОБУЧЕНИЕ: ОДИНОЧНАЯ МОДЕЛЬ НА N КЛАССОВ
 # ============================================================
 
-def train_single(dataset_name, epochs=15, lr=1e-3, seed=42):
+def train_model(train_loader, num_classes, epochs=15, lr=1e-3, seed=42, label=""):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    train_loader, test_loader = get_loaders(dataset_name)
-    model = BasisNet().to(device)
+    model = BasisNet(num_classes=num_classes).to(device)
     opt = optim.Adam([p for p in model.parameters() if p.requires_grad], lr=lr)
     sched = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
     crit = nn.CrossEntropyLoss()
 
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
+    t0 = time.time()
+
     for ep in range(epochs):
         model.train()
+        total_loss = 0.0
         for x, y in train_loader:
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
             opt.zero_grad()
             loss = crit(model(x), y)
             loss.backward()
             opt.step()
+            total_loss += loss.item()
         sched.step()
+        if (ep + 1) % 5 == 0 or ep + 1 == epochs:
+            print(f"    {label} эпоха {ep+1:>2}/{epochs} | loss = {total_loss/len(train_loader):.4f}")
 
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
+    t = time.time() - t0
+    return model, t
+
+
+def eval_accuracy(model, loader, device):
     model.eval()
     correct = 0
+    total = 0
     with torch.no_grad():
-        for x, y in test_loader:
+        for x, y in loader:
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
-            correct += (model(x).argmax(1) == y).sum().item()
-    acc = 100 * correct / len(test_loader.dataset)
-    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    return acc, n_params
-
-
-# ============================================================
-# ОБУЧЕНИЕ МУЛЬТИЗАДАЧНОЙ МОДЕЛИ
-# ============================================================
-
-def train_multitask(dataset_names, share_trunk, epochs=15, lr=1e-3, seed=42):
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    loaders = [get_loaders(name) for name in dataset_names]
-    train_loaders = [l[0] for l in loaders]
-    test_loaders  = [l[1] for l in loaders]
-
-    model = MultiTaskNet(num_tasks=len(dataset_names),
-                         share_trunk=share_trunk).to(device)
-    opt = optim.Adam([p for p in model.parameters() if p.requires_grad], lr=lr)
-    sched = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
-    crit = nn.CrossEntropyLoss()
-
-    # Итераторы на все задачи; по одному батчу на задачу за шаг
-    def cycle(loader):
-        while True:
-            for batch in loader:
-                yield batch
-
-    iters = [cycle(l) for l in train_loaders]
-    steps_per_epoch = min(len(l) for l in train_loaders)
-
-    for ep in range(epochs):
-        model.train()
-        for _ in range(steps_per_epoch):
-            opt.zero_grad()
-            total_loss = 0.0
-            for task_id in range(len(dataset_names)):
-                x, y = next(iters[task_id])
-                x = x.to(device, non_blocking=True)
-                y = y.to(device, non_blocking=True)
-                out = model(x, task_id=task_id)
-                total_loss = total_loss + crit(out, y)
-            total_loss.backward()
-            opt.step()
-        sched.step()
-
-    # Оценка по каждой задаче
-    accs = []
-    model.eval()
-    with torch.no_grad():
-        for task_id, test_loader in enumerate(test_loaders):
-            correct = 0
-            for x, y in test_loader:
-                x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
-                out = model(x, task_id=task_id)
-                correct += (out.argmax(1) == y).sum().item()
-            accs.append(100 * correct / len(test_loader.dataset))
-
-    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    return accs, n_params
+            pred = model(x).argmax(1)
+            correct += (pred == y).sum().item()
+            total += y.numel()
+    return 100 * correct / total
 
 
 # ============================================================
@@ -235,55 +199,91 @@ if __name__ == "__main__":
     if device.type == 'cuda':
         print(f"GPU: {torch.cuda.get_device_name(0)}")
 
-    dataset_names = ["MNIST", "FashionMNIST", "KMNIST"]
-    epochs = 15
+    EPOCHS = 15
+    SEED = 42
 
-    # ---------- 1. Независимые модели ----------
-    print(f"\n{'='*72}\n1. INDEPENDENT: 3 отдельные модели\n{'='*72}")
-    indep_accs = []
-    indep_params_total = 0
-    for name in dataset_names:
-        t0 = time.time()
-        acc, n_params = train_single(name, epochs=epochs)
-        t = time.time() - t0
-        print(f"  {name:<15} точн={acc:6.2f}%  параметров={n_params:>8,}  время={t:5.1f}с")
-        indep_accs.append(acc)
-        indep_params_total += n_params
+    # ---------- 1. Три эксперта ----------
+    print(f"\n{'='*72}\n1. ТРИ НЕЗАВИСИМЫХ ЭКСПЕРТА\n{'='*72}")
+    experts = []
+    expert_accs = []
+    for i, name in enumerate(DOMAIN_NAMES):
+        print(f"\n  >>> Эксперт {i+1}: {name}")
+        train_ds = get_raw_dataset(name, train=True)
+        test_ds  = get_raw_dataset(name, train=False)
+        train_loader = DataLoader(train_ds, batch_size=128, shuffle=True,
+                                  num_workers=2, pin_memory=True)
+        test_loader  = DataLoader(test_ds, batch_size=1000, shuffle=False,
+                                  num_workers=2, pin_memory=True)
+        model, t = train_model(train_loader, num_classes=10,
+                               epochs=EPOCHS, seed=SEED, label=name)
+        acc = eval_accuracy(model, test_loader, device)
+        print(f"    Точность {name}: {acc:.2f}%  |  время: {t:.1f}с")
+        experts.append(model)
+        expert_accs.append(acc)
 
-    # ---------- 2. Общий ствол ----------
-    print(f"\n{'='*72}\n2. SHARED TRUNK: общий базис + общий ствол + 3 головы\n{'='*72}")
-    t0 = time.time()
-    shared_trunk_accs, shared_trunk_params = train_multitask(
-        dataset_names, share_trunk=True, epochs=epochs)
-    t = time.time() - t0
-    for name, acc in zip(dataset_names, shared_trunk_accs):
-        print(f"  {name:<15} точн={acc:6.2f}%")
-    print(f"  Всего параметров: {shared_trunk_params:,}  |  время: {t:.1f}с")
+    # ---------- 2. Domain router ----------
+    print(f"\n{'='*72}\n2. DOMAIN ROUTER (3 класса)\n{'='*72}")
+    router_train, router_test = get_domain_loaders()
+    router, t_router = train_model(router_train, num_classes=3,
+                                    epochs=EPOCHS, seed=SEED, label="router")
+    router_acc = eval_accuracy(router, router_test, device)
+    print(f"    Точность router: {router_acc:.2f}%  |  время: {t_router:.1f}с")
 
-    # ---------- 3. Только базис общий ----------
-    print(f"\n{'='*72}\n3. SHARED BASIS ONLY: общий базис + 3 ствола + 3 головы\n{'='*72}")
-    t0 = time.time()
-    shared_basis_accs, shared_basis_params = train_multitask(
-        dataset_names, share_trunk=False, epochs=epochs)
-    t = time.time() - t0
-    for name, acc in zip(dataset_names, shared_basis_accs):
-        print(f"  {name:<15} точн={acc:6.2f}%")
-    print(f"  Всего параметров: {shared_basis_params:,}  |  время: {t:.1f}с")
+    # ---------- 3. Каскад ----------
+    print(f"\n{'='*72}\n3. КАСКАД: router → expert\n{'='*72}")
+    cascade_correct_total = 0
+    cascade_total = 0
+    per_domain_cascade = []
+
+    for i, name in enumerate(DOMAIN_NAMES):
+        test_ds = get_raw_dataset(name, train=False)
+        test_loader = DataLoader(test_ds, batch_size=1000, shuffle=False,
+                                 num_workers=2, pin_memory=True)
+        correct = 0
+        total = 0
+        with torch.no_grad():
+            for x, y in test_loader:
+                x = x.to(device, non_blocking=True)
+                y = y.to(device, non_blocking=True)
+                # Router выбирает домен
+                domain_pred = router(x).argmax(1)
+                # Эксперт работает по своему домену
+                expert_pred = experts[i](x).argmax(1)
+                # Правильно, если router попал в этот домен И эксперт угадал класс
+                correct += ((domain_pred == i) & (expert_pred == y)).sum().item()
+                total += y.numel()
+        acc = 100 * correct / total
+        per_domain_cascade.append(acc)
+        cascade_correct_total += correct
+        cascade_total += total
+        print(f"    {name:<15} точность каскада: {acc:.2f}%")
+
+    cascade_overall = 100 * cascade_correct_total / cascade_total
+    print(f"    Средняя по всем доменам: {cascade_overall:.2f}%")
+
+    # ---------- 4. Единая модель на 30 классах ----------
+    print(f"\n{'='*72}\n4. ЕДИНАЯ МОДЕЛЬ на 30 классах (baseline)\n{'='*72}")
+    global_train, global_test = get_global_loaders()
+    single_model, t_single = train_model(global_train, num_classes=30,
+                                          epochs=EPOCHS, seed=SEED, label="single30")
+    single_acc = eval_accuracy(single_model, global_test, device)
+    print(f"    Точность единой модели: {single_acc:.2f}%  |  время: {t_single:.1f}с")
 
     # ---------- Сводка ----------
-    print("\n\n" + "=" * 88)
-    print("СВОДКА".center(88))
-    print("=" * 88)
-    header = f"{'Режим':<26}{'MNIST':>10}{'Fashion':>10}{'KMNIST':>10}{'Параметры':>14}{'Ср.точн':>10}"
-    print(header)
-    print("-" * 88)
+    print("\n\n" + "=" * 82)
+    print("СВОДКА".center(82))
+    print("=" * 82)
+    print(f"\n{'Метод':<36}{'MNIST':>10}{'Fashion':>10}{'KMNIST':>10}{'Среднее':>10}")
+    print("-" * 82)
+    print(f"{'Три независимых эксперта':<36}"
+          f"{expert_accs[0]:>9.2f}%{expert_accs[1]:>9.2f}%{expert_accs[2]:>9.2f}%"
+          f"{sum(expert_accs)/3:>9.2f}%")
+    print(f"{'Каскад (router → expert)':<36}"
+          f"{per_domain_cascade[0]:>9.2f}%{per_domain_cascade[1]:>9.2f}%{per_domain_cascade[2]:>9.2f}%"
+          f"{cascade_overall:>9.2f}%")
+    print(f"{'Единая модель (30 классов)':<36}"
+          f"{'—':>10}{'—':>10}{'—':>10}{single_acc:>9.2f}%")
+    print("=" * 82)
 
-    def row(label, accs, params):
-        avg = sum(accs) / len(accs)
-        return (f"{label:<26}{accs[0]:>9.2f}%{accs[1]:>9.2f}%{accs[2]:>9.2f}%"
-                f"{params:>13,}{avg:>9.2f}%")
-
-    print(row("Independent (3 модели)", indep_accs, indep_params_total))
-    print(row("Shared trunk", shared_trunk_accs, shared_trunk_params))
-    print(row("Shared basis only", shared_basis_accs, shared_basis_params))
-    print("=" * 88)
+    print(f"\nТочность router: {router_acc:.2f}%")
+    print(f"Разница эксперты − каскад: {sum(expert_accs)/3 - cascade_overall:.2f}% (это цена роутинга)")
