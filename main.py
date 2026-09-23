@@ -1,17 +1,16 @@
 """
-best_basis_model.py
-===================
-Лучшая модель по результатам экспериментов:
+compare_improvements.py
+=======================
+Проверяем вклад улучшений поверх лучшей модели (4 фикс + ReLU + stride=2):
 
-    4 фиксированных геометрических фильтра 2x2
-    + ReLU
-    + stride=2 (неперекрывающиеся окна)
+    1. Базовая (как было)                       — baseline
+    2. + Нормализация данных                    — normalize
+    3. + Нормализация + CosineAnnealingLR       — sched
+    4. + Нормализация + Cosine + больше эпох    — long
 
-Поддерживает grayscale (1 канал) и RGB (3 канала, groups=3).
-Работает на MNIST / FashionMNIST / KMNIST / CIFAR-10.
+Все конфигурации с одинаковым seed — сравнение честное.
 """
 
-import os
 import warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
@@ -20,112 +19,113 @@ import torch.nn as nn
 import torch.optim as optim
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader
-from PIL import Image
+import time
 
 # ============================================================
-# 1. ГЕОМЕТРИЧЕСКИЙ БАЗИС (4 независимых направления)
+# 1. ФИКСИРОВАННЫЙ БАЗИС
 # ============================================================
 
 TEMPLATES = torch.tensor([
-    [[ 1,  1], [ 1,  1]],   # плотность / среднее
-    [[ 1,  1], [-1, -1]],   # вертикальный перепад (верх-низ)
-    [[ 1, -1], [ 1, -1]],   # горизонтальный перепад (лево-право)
-    [[ 1, -1], [-1,  1]],   # диагональный перепад
+    [[ 1,  1], [ 1,  1]],
+    [[ 1,  1], [-1, -1]],
+    [[ 1, -1], [ 1, -1]],
+    [[ 1, -1], [-1,  1]],
 ], dtype=torch.float32)
 
+
 # ============================================================
-# 2. АРХИТЕКТУРА
+# 2. МОДЕЛЬ
 # ============================================================
 
 class BasisNet(nn.Module):
-    """
-    4 фиксированных фильтра 2x2 + ReLU + stride=2.
-    Первый слой не обучается; всё остальное — обычные сверточные блоки.
-    """
     def __init__(self, in_channels=1, num_classes=10, stride=2):
         super().__init__()
         groups = in_channels if in_channels > 1 else 1
-        out_ch = 4 * groups  # 4 для grayscale, 12 для RGB
+        out_ch = 4 * groups
 
-        # --- Фиксированный геометрический слой ---
-        self.fixed_conv = nn.Conv2d(
-            in_channels, out_ch,
-            kernel_size=2, stride=stride, padding=0,
-            bias=False, groups=groups
-        )
-        w = TEMPLATES.unsqueeze(1).repeat(groups, 1, 1, 1)  # (out_ch, 1, 2, 2)
+        self.fixed_conv = nn.Conv2d(in_channels, out_ch, 2, stride=stride,
+                                    padding=0, bias=False, groups=groups)
+        w = TEMPLATES.unsqueeze(1).repeat(groups, 1, 1, 1)
         self.fixed_conv.weight = nn.Parameter(w, requires_grad=False)
-
         self.act = nn.ReLU()
 
-        # --- Обучаемая часть ---
         self.features = nn.Sequential(
-            nn.Conv2d(out_ch, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-
-            nn.Conv2d(64, 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-
+            nn.Conv2d(out_ch, 64, 3, padding=1),
+            nn.BatchNorm2d(64), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(64, 128, 3, padding=1),
+            nn.BatchNorm2d(128), nn.ReLU(), nn.MaxPool2d(2),
             nn.AdaptiveAvgPool2d((1, 1)),
         )
         self.classifier = nn.Linear(128, num_classes)
 
     def forward(self, x):
-        x = self.fixed_conv(x)
-        x = self.act(x)
+        x = self.act(self.fixed_conv(x))
         x = self.features(x)
-        x = torch.flatten(x, 1)
-        return self.classifier(x)
+        return self.classifier(torch.flatten(x, 1))
 
 
 # ============================================================
 # 3. ДАННЫЕ
 # ============================================================
 
-DATASETS = {
-    "MNIST":        (datasets.MNIST,        "./data",       1, 10),
-    "FashionMNIST": (datasets.FashionMNIST, "./data",       1, 10),
-    "KMNIST":       (datasets.KMNIST,       "./data",       1, 10),
-    "CIFAR10":      (datasets.CIFAR10,      "./data", 3, 10),
+# Средние и std для нормализации (стандартные для MNIST-семейства)
+NORM_STATS = {
+    "MNIST":        ((0.1307,), (0.3081,)),
+    "FashionMNIST": ((0.2860,), (0.3530,)),
+    "KMNIST":       ((0.1918,), (0.3483,)),
 }
 
 
-def get_loaders(name, batch_size=128):
-    cls, root, in_ch, _ = DATASETS[name]
-    tf = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.1307,), (0.3081,))  # MNIST
-    ])
+def get_loaders(name, normalize=False, batch_size=128):
+    if name == "MNIST":
+        cls, root = datasets.MNIST, "./data"
+    elif name == "FashionMNIST":
+        cls, root = datasets.FashionMNIST, "./data"
+    elif name == "KMNIST":
+        cls, root = datasets.KMNIST, "./data"
+    else:
+        raise ValueError(name)
+
+    tf_list = [transforms.ToTensor()]
+    if normalize:
+        mean, std = NORM_STATS[name]
+        tf_list.append(transforms.Normalize(mean, std))
+    tf = transforms.Compose(tf_list)
+
     train_ds = cls(root=root, train=True,  download=True, transform=tf)
     test_ds  = cls(root=root, train=False, download=True, transform=tf)
+
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
                               num_workers=2, pin_memory=True)
     test_loader  = DataLoader(test_ds,  batch_size=1000, shuffle=False,
                               num_workers=2, pin_memory=True)
-    return train_loader, test_loader, in_ch
+    return train_loader, test_loader
 
 
 # ============================================================
 # 4. ОБУЧЕНИЕ
 # ============================================================
 
-def train(dataset_name, epochs=5, lr=1e-3, save_path=None, seed=42):
+def run_experiment(dataset_name, epochs, normalize, use_scheduler, seed=42, lr=1e-3):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Устройство: {device}")
 
-    train_loader, test_loader, in_ch = get_loaders(dataset_name)
-    model = BasisNet(in_channels=in_ch).to(device)
+    train_loader, test_loader = get_loaders(dataset_name, normalize=normalize)
+    model = BasisNet(in_channels=1).to(device)
 
     trainable = [p for p in model.parameters() if p.requires_grad]
     opt = optim.Adam(trainable, lr=lr)
     crit = nn.CrossEntropyLoss()
+
+    sched = None
+    if use_scheduler:
+        sched = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
+
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
+    t0 = time.time()
 
     for ep in range(1, epochs + 1):
         model.train()
@@ -137,106 +137,62 @@ def train(dataset_name, epochs=5, lr=1e-3, save_path=None, seed=42):
             loss.backward()
             opt.step()
             total_loss += loss.item()
-        print(f"  Эпоха {ep}/{epochs} | loss = {total_loss / len(train_loader):.4f}")
+        if sched is not None:
+            sched.step()
 
-    # --- Тест ---
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
+    train_time = time.time() - t0
+
     model.eval()
     correct = 0
     with torch.no_grad():
         for x, y in test_loader:
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
             correct += (model(x).argmax(1) == y).sum().item()
+
     acc = 100 * correct / len(test_loader.dataset)
-    print(f"  Точность на тесте ({dataset_name}): {acc:.2f}%")
-
-    # --- Сохранение ---
-    if save_path is None:
-        save_path = f"basis_{dataset_name.lower()}.pth"
-    torch.save({
-        "state_dict": model.state_dict(),
-        "in_channels": in_ch,
-        "dataset": dataset_name,
-    }, save_path)
-    print(f"  Модель сохранена: {save_path}")
-
-    return model, acc
+    return acc, train_time
 
 
 # ============================================================
-# 5. ЗАГРУЗКА И ИНФЕРЕНС
-# ============================================================
-
-CLASSES = {
-    "MNIST":        [str(i) for i in range(10)],
-    "FashionMNIST": ['футболка', 'брюки', 'свитер', 'платье', 'пальто',
-                     'сандалии', 'рубашка', 'кроссовки', 'сумка', 'ботинки'],
-    "KMNIST":       [f'хирагана_{i}' for i in range(10)],
-    "CIFAR10":      ['самолет', 'автомобиль', 'птица', 'кошка', 'олень',
-                     'собака', 'лягушка', 'лошадь', 'корабль', 'грузовик'],
-}
-
-
-def load_model(path):
-    ckpt = torch.load(path, map_location="cpu", weights_only=False)
-    in_ch = ckpt.get("in_channels", 1)
-    dataset = ckpt.get("dataset", "MNIST")
-    model = BasisNet(in_channels=in_ch)
-    model.load_state_dict(ckpt["state_dict"])
-    model.eval()
-    return model, dataset
-
-
-def predict(image_path, model_path):
-    if not os.path.exists(model_path):
-        print(f"Ошибка: {model_path} не найден. Сначала обучите модель.")
-        return
-    if not os.path.exists(image_path):
-        print(f"Ошибка: файл {image_path} не найден.")
-        return
-
-    model, dataset = load_model(model_path)
-    in_ch = 3 if dataset == "CIFAR10" else 1
-
-    # --- Препроцессинг ---
-    if in_ch == 1:
-        img = Image.open(image_path).convert("L")
-        size = 28
-    else:
-        img = Image.open(image_path).convert("RGB")
-        size = 32
-    img = img.resize((size, size), Image.BILINEAR)
-
-    tf = transforms.ToTensor()
-    x = tf(img).unsqueeze(0)
-
-    # --- Инференс ---
-    with torch.no_grad():
-        out = model(x)
-        prob = torch.softmax(out, 1).squeeze()
-        pred = int(prob.argmax())
-
-    labels = CLASSES.get(dataset, [str(i) for i in range(10)])
-    print(f"\n--- {image_path} ---")
-    print(f"Предсказание: {labels[pred]}")
-    print(f"Уверенность:  {prob[pred]*100:.2f}%")
-    print("\nТоп-3:")
-    top3 = torch.topk(prob, 3)
-    for p, i in zip(top3.values.tolist(), top3.indices.tolist()):
-        print(f"  {labels[i]:<12} {p*100:6.2f}%")
-
-
-# ============================================================
-# ТОЧКА ВХОДА
+# 5. ЗАПУСК
 # ============================================================
 
 if __name__ == "__main__":
-    # --- Обучить на MNIST (быстро, 5 эпох) ---
-    train("MNIST", epochs=5)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Устройство: {device}")
+    if device.type == 'cuda':
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
 
-    # --- Или на FashionMNIST / KMNIST / CIFAR10 ---
-    # train("FashionMNIST", epochs=5)
-    # train("KMNIST",        epochs=5)
-    # train("CIFAR10",       epochs=15)
+    # (имя, эпох, normalize, scheduler)
+    configs = [
+        ("1. Базовая (5 эпох)",              5,  False, False),
+        ("2. + Нормализация (5 эпох)",       5,  True,  False),
+        ("3. + Норм + Cosine (5 эпох)",      5,  True,  True),
+        ("4. + Норм + Cosine (15 эпох)",     15, True,  True),
+    ]
 
-    # --- Инференс по картинке ---
-    # predict("my_digit.png", "basis_mnist.pth")
+    datasets_to_run = ["MNIST", "FashionMNIST"]
+
+    summary = {}
+    for ds in datasets_to_run:
+        print(f"\n{'='*70}\nНАБОР: {ds}\n{'='*70}")
+        rows = []
+        for name, ep, norm, sched in configs:
+            print(f"\n>>> {name}")
+            acc, t = run_experiment(ds, epochs=ep, normalize=norm, use_scheduler=sched)
+            print(f"    Точность: {acc:.2f}%  |  Время: {t:.1f}с")
+            rows.append((name, acc, t))
+        summary[ds] = rows
+
+    # --- Итог ---
+    print("\n\n" + "=" * 78)
+    print("СВОДКА".center(78))
+    print("=" * 78)
+    for ds in datasets_to_run:
+        print(f"\n### {ds} ###")
+        print(f"{'Конфигурация':<32}{'Точность':>12}{'Время':>10}")
+        print("-" * 54)
+        for name, acc, t in summary[ds]:
+            print(f"{name:<32}{acc:>11.2f}%{t:>9.1f}с")
