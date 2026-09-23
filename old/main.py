@@ -6,10 +6,9 @@ from torchvision import datasets, transforms
 from torch.utils.data import DataLoader
 from PIL import Image
 
-# СВЕРХБЫСТРОЕ ЗЕРКАЛО GOOGLE
-# datasets.CIFAR10.url = "https://googleapis.com"
-
-# 1. НАШИ СБАЛАНСИРОВАННЫЕ ФИЛЬТРЫ 2x2
+# ==========================================
+# 1. ГЕОМЕТРИЧЕСКИЙ БАЗИС 2x2 (ВАША ЛОГИКА)
+# ==========================================
 TEMPLATES = torch.tensor([
     [[-1, -1], [-1, -1]],  # Инвертированный фон
     [[ 1,  1], [ 1,  1]],  # Плотность
@@ -21,52 +20,45 @@ TEMPLATES = torch.tensor([
     [[-1,  1], [ 1, -1]]   # Диагональ побочная
 ], dtype=torch.float32)
 
-MODEL_PATH = "cifar_basis_model.pth"
+MODEL_PATH = "custom_basis_model.pth"
 
-# Список классов CIFAR-10 для человекочитаемого вывода
-CLASSES = ['самолет', 'автомобиль', 'птица', 'кошка', 'олень', 'собака', 'лягушка', 'лошадь', 'корабль', 'грузовик']
-
-# 2. АРХИТЕКТУРА ДЛЯ ЦВЕТНЫХ КАРТИНОК
-class CifarBasisNet(nn.Module):
+# ==========================================
+# 2. АРХИТЕКТУРА СЕТИ С ФИКСИРОВАННЫМ СЛОЕМ
+# ==========================================
+class CustomBasisNet(nn.Module):
     def __init__(self):
         super().__init__()
         
-        # Слой 1: Фиксированный базис для RGB (groups=3 обрабатывает каналы изолированно)
-        self.fixed_conv = nn.Conv2d(3, 24, kernel_size=2, stride=2, padding=0, bias=False, groups=3)
-        fixed_weights = TEMPLATES.unsqueeze(1).repeat(3, 1, 1, 1) # Форма: (24, 1, 2, 2)
+        # Слой 1: Фиксированные 8 фильтров 2x2. Сканируем со stride=1
+        self.fixed_conv = nn.Conv2d(1, 8, kernel_size=2, stride=2, padding=0, bias=False)
+        fixed_weights = TEMPLATES.unsqueeze(1) # Подгоняем форму под (8, 1, 2, 2)
         self.fixed_conv.weight = nn.Parameter(fixed_weights, requires_grad=False)
         
-        # Слой 2: Первое обучаемое расширение (24 -> 64 канала, размер 16x16 -> 8x8)
-        self.layer1 = nn.Sequential(
-            nn.Conv2d(24, 64, kernel_size=3, stride=1, padding=1),
+        # Слой 2: Обучаемое расширение до 64 каналов
+        self.expanded_conv = nn.Sequential(
+            nn.Conv2d(8, 64, kernel_size=3, stride=1, padding=1),
             nn.BatchNorm2d(64),
             nn.ReLU(),
-            nn.MaxPool2d(2)
+            nn.MaxPool2d(2) # 27x27 -> 13x13
         )
         
-        # Слой 3: Углубление (64 -> 128 каналов, размер 8x8 -> 4x4)
-        self.layer2 = nn.Sequential(
+        # Слой 3: Углубление абстракции до 128 каналов
+        self.deep_conv = nn.Sequential(
             nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),
             nn.BatchNorm2d(128),
             nn.ReLU(),
-            nn.MaxPool2d(2)
+            nn.MaxPool2d(2) # 13x13 -> 6x6
         )
         
-        # Слой 4: Финальное абстрагирование
-        self.layer3 = nn.Sequential(
-            nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(256),
-            nn.ReLU(),
-            nn.AdaptiveAvgPool2d((1, 1)) # Сжимаем до вектора в 256 чисел
-        )
-        
-        self.classifier = nn.Linear(256, 10)
+        # Слой 4: Глобальная агрегация признаков и сужение до 10 классов
+        self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.classifier = nn.Linear(128, 10)
         
     def forward(self, x):
-        x = self.fixed_conv(x)
-        x = self.layer1(x)
-        x = self.layer2(x)
-        x = self.layer3(x)
+        x = self.fixed_conv(x) 
+        x = self.expanded_conv(x)
+        x = self.deep_conv(x)
+        x = self.global_pool(x)
         x = torch.flatten(x, 1)
         return self.classifier(x)
 
@@ -75,21 +67,23 @@ class CifarBasisNet(nn.Module):
 # ==========================================
 def train_pipeline():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Запуск эксперимента на CIFAR-10 ({device})...")
+    print(f"Используем устройство для обучения: {device}")
     
+    # Загрузка данных без искажающей нормализации (чистый контраст)
     transform = transforms.Compose([transforms.ToTensor()])
     
-    train_dataset = datasets.CIFAR10(root='./data_cifar', train=True, download=True, transform=transform)
-    test_dataset = datasets.CIFAR10(root='./data_cifar', train=False, download=True, transform=transform)
+    train_dataset = datasets.MNIST(root='./data', train=True, download=True, transform=transform)
+    test_dataset = datasets.MNIST(root='./data', train=False, download=True, transform=transform)
     
     train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
     test_loader = DataLoader(test_dataset, batch_size=1000, shuffle=False)
     
-    model = CifarBasisNet().to(device)
+    model = CustomBasisNet().to(device)
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=0.001)
     
-    epochs = 15
+    # Обучаем 3 эпохи для надежной фиксации весов верхних слоев
+    epochs = 10
     for epoch in range(1, epochs + 1):
         model.train()
         total_loss = 0
@@ -104,7 +98,7 @@ def train_pipeline():
             
         print(f"Эпоха {epoch}/{epochs} | Средняя ошибка: {total_loss/len(train_loader):.4f}")
         
-    # Проверка точности
+    # Валидация
     model.eval()
     correct = 0
     with torch.no_grad():
@@ -113,33 +107,36 @@ def train_pipeline():
             output = model(data)
             pred = output.argmax(dim=1, keepdim=True)
             correct += pred.eq(target.view_as(pred)).sum().item()
-
+            
     accuracy = 100. * correct / len(test_loader.dataset)
-    print(f"\nТочность геометрического базиса на CIFAR-10: {accuracy:.2f}%")
+    print(f"\nИтоговая точность на тесте: {accuracy:.2f}%")
     
     # СОХРАНЕНИЕ МОДЕЛИ
+    # Мы сохраняем state_dict (только веса). Фиксированный первый слой запишется автоматически.
     torch.save(model.state_dict(), MODEL_PATH)
     print(f"Успех! Веса модели сохранены в файл: {MODEL_PATH}")
 
 # ==========================================
 # 4. ФУНКЦИЯ ДЛЯ ПРЕДСКАЗАНИЯ (ИНФЕРЕНС)
 # ==========================================
-def predict_cifar_image(image_path):
+def predict_image(image_path):
     if not os.path.exists(MODEL_PATH):
         print(f"Ошибка: Файл весов {MODEL_PATH} не найден. Сначала запустите обучение!")
         return
         
-    model = CifarBasisNet()
+    # Инициализируем архитектуру и загружаем сохраненные веса
+    model = CustomBasisNet()
     model.load_state_dict(torch.load(MODEL_PATH, map_location=torch.device('cpu')))
     model.eval()
     
+    # Подготовка стороннего изображения к формату сети (ЧБ, 28x28)
     try:
-        # Открываем изображение, принудительно переводим в цветной RGB режим
-        img = Image.open(image_path).convert('RGB')
-        img = img.resize((32, 32), Image.Resampling.BILINEAR) # Сжимаем до размера CIFAR
+        img = Image.open(image_path).convert('L') # В градации серого
+        img = img.resize((28, 28)) # Меняем размер под MNIST
         
+        # Превращаем в тензор PyTorch и добавляем размерность батча (1, 1, 28, 28)
         transform = transforms.ToTensor()
-        img_tensor = transform(img).unsqueeze(0) # Добавляем размерность батча (1, 3, 32, 32)
+        img_tensor = transform(img).unsqueeze(0)
         
         with torch.no_grad():
             output = model(img_tensor)
@@ -147,16 +144,19 @@ def predict_cifar_image(image_path):
             probabilities = torch.softmax(output, dim=1).squeeze().tolist()
             
         print(f"\n--- Анализ файла {image_path} ---")
-        print(f"Результат предсказания: {CLASSES[prediction].upper()}")
+        print(f"Результат предсказания: ЦИФРА {prediction}")
         print(f"Уверенность сети: {probabilities[prediction]*100:.2f}%")
         
     except Exception as e:
         print(f"Ошибка при обработке изображения: {e}")
 
+# ==========================================
+# ТОЧКА ВХОДА ДЛЯ ЗАПУСКА
+# ==========================================
 if __name__ == "__main__":
-    # Запуск основного цикла обучения и сохранения
+    # Шаг 1: Запускаем обучение и сохраняем файл весов .pth
     train_pipeline()
     
-    # Инференс: чтобы проверить свою картинку (например, фото машины или кота), 
-    # положите её в папку, раскомментируйте строку ниже и укажите имя файла:
-    predict_cifar_image("car.jpg")
+    # Шаг 2: Демонстрация инференса. 
+    # Если у вас есть своя картинка цифры, можете раскомментировать код ниже и передать путь к ней:
+    # predict_image("my_handwritten_digit.png")
