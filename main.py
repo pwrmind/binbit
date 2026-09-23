@@ -1,14 +1,20 @@
 """
-compare_improvements.py
-=======================
-Проверяем вклад улучшений поверх лучшей модели (4 фикс + ReLU + stride=2):
+final_experiments.py
+====================
+Закрываем открытые вопросы:
 
-    1. Базовая (как было)                       — baseline
-    2. + Нормализация данных                    — normalize
-    3. + Нормализация + CosineAnnealingLR       — sched
-    4. + Нормализация + Cosine + больше эпох    — long
+  Для MNIST и FashionMNIST:
+     A. 15 эпох, без аугментации, фикс. базис  (референс)
+     B. 25 эпох, без аугментации, фикс. базис
+     C. 25 эпох, +аугментация,    фикс. базис
+     D. 25 эпох, +аугментация,    обучаемый слой, инициализированный шаблонами
 
-Все конфигурации с одинаковым seed — сравнение честное.
+  Для CIFAR-10:
+     E. 25 эпох, +аугментация, фикс. базис (groups=3, 12 каналов)
+     F. 25 эпох, +аугментация, обучаемый слой (init шаблонами)
+
+Без нормализации — мы доказали, что она вредит базису.
+С CosineAnnealingLR везде.
 """
 
 import warnings
@@ -20,6 +26,7 @@ import torch.optim as optim
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader
 import time
+
 
 # ============================================================
 # 1. ФИКСИРОВАННЫЙ БАЗИС
@@ -38,19 +45,19 @@ TEMPLATES = torch.tensor([
 # ============================================================
 
 class BasisNet(nn.Module):
-    def __init__(self, in_channels=1, num_classes=10, stride=2):
+    def __init__(self, in_channels=1, num_classes=10, stride=2, trainable=False):
         super().__init__()
         groups = in_channels if in_channels > 1 else 1
-        out_ch = 4 * groups
+        self.out_ch = 4 * groups
 
-        self.fixed_conv = nn.Conv2d(in_channels, out_ch, 2, stride=stride,
+        self.fixed_conv = nn.Conv2d(in_channels, self.out_ch, 2, stride=stride,
                                     padding=0, bias=False, groups=groups)
         w = TEMPLATES.unsqueeze(1).repeat(groups, 1, 1, 1)
-        self.fixed_conv.weight = nn.Parameter(w, requires_grad=False)
-        self.act = nn.ReLU()
+        self.fixed_conv.weight = nn.Parameter(w, requires_grad=trainable)
 
+        self.act = nn.ReLU()
         self.features = nn.Sequential(
-            nn.Conv2d(out_ch, 64, 3, padding=1),
+            nn.Conv2d(self.out_ch, 64, 3, padding=1),
             nn.BatchNorm2d(64), nn.ReLU(), nn.MaxPool2d(2),
             nn.Conv2d(64, 128, 3, padding=1),
             nn.BatchNorm2d(128), nn.ReLU(), nn.MaxPool2d(2),
@@ -65,63 +72,69 @@ class BasisNet(nn.Module):
 
 
 # ============================================================
-# 3. ДАННЫЕ
+# 3. ДАННЫЕ + АУГМЕНТАЦИЯ
 # ============================================================
 
-# Средние и std для нормализации (стандартные для MNIST-семейства)
-NORM_STATS = {
-    "MNIST":        ((0.1307,), (0.3081,)),
-    "FashionMNIST": ((0.2860,), (0.3530,)),
-    "KMNIST":       ((0.1918,), (0.3483,)),
-}
+def get_transforms(dataset_name, augment):
+    if dataset_name == "CIFAR10":
+        base = [transforms.ToTensor()]
+        if augment:
+            base = [
+                transforms.RandomCrop(32, padding=4),
+                transforms.RandomHorizontalFlip(),
+                transforms.ToTensor(),
+            ]
+        return transforms.Compose(base)
+
+    # MNIST / FashionMNIST
+    if augment:
+        return transforms.Compose([
+            transforms.RandomAffine(degrees=0, translate=(0.05, 0.05)),
+            transforms.ToTensor(),
+        ])
+    return transforms.Compose([transforms.ToTensor()])
 
 
-def get_loaders(name, normalize=False, batch_size=128):
-    if name == "MNIST":
-        cls, root = datasets.MNIST, "./data"
-    elif name == "FashionMNIST":
-        cls, root = datasets.FashionMNIST, "./data"
-    elif name == "KMNIST":
-        cls, root = datasets.KMNIST, "./data"
+def get_loaders(dataset_name, augment, batch_size=128):
+    tf_train = get_transforms(dataset_name, augment=augment)
+    tf_test  = transforms.Compose([transforms.ToTensor()])
+
+    if dataset_name == "MNIST":
+        cls, root, in_ch = datasets.MNIST, "./data", 1
+    elif dataset_name == "FashionMNIST":
+        cls, root, in_ch = datasets.FashionMNIST, "./data", 1
+    elif dataset_name == "CIFAR10":
+        cls, root, in_ch = datasets.CIFAR10, "./data_cifar", 3
     else:
-        raise ValueError(name)
+        raise ValueError(dataset_name)
 
-    tf_list = [transforms.ToTensor()]
-    if normalize:
-        mean, std = NORM_STATS[name]
-        tf_list.append(transforms.Normalize(mean, std))
-    tf = transforms.Compose(tf_list)
-
-    train_ds = cls(root=root, train=True,  download=True, transform=tf)
-    test_ds  = cls(root=root, train=False, download=True, transform=tf)
+    train_ds = cls(root=root, train=True,  download=True, transform=tf_train)
+    test_ds  = cls(root=root, train=False, download=True, transform=tf_test)
 
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
                               num_workers=2, pin_memory=True)
     test_loader  = DataLoader(test_ds,  batch_size=1000, shuffle=False,
                               num_workers=2, pin_memory=True)
-    return train_loader, test_loader
+    return train_loader, test_loader, in_ch
 
 
 # ============================================================
 # 4. ОБУЧЕНИЕ
 # ============================================================
 
-def run_experiment(dataset_name, epochs, normalize, use_scheduler, seed=42, lr=1e-3):
+def run_experiment(dataset_name, epochs, augment, trainable, lr=1e-3, seed=42):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    train_loader, test_loader = get_loaders(dataset_name, normalize=normalize)
-    model = BasisNet(in_channels=1).to(device)
+    train_loader, test_loader, in_ch = get_loaders(dataset_name, augment=augment)
+    model = BasisNet(in_channels=in_ch, trainable=trainable).to(device)
 
-    trainable = [p for p in model.parameters() if p.requires_grad]
-    opt = optim.Adam(trainable, lr=lr)
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    opt = optim.Adam(trainable_params, lr=lr)
+    sched = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
     crit = nn.CrossEntropyLoss()
-
-    sched = None
-    if use_scheduler:
-        sched = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
 
     if device.type == 'cuda':
         torch.cuda.synchronize()
@@ -137,8 +150,10 @@ def run_experiment(dataset_name, epochs, normalize, use_scheduler, seed=42, lr=1
             loss.backward()
             opt.step()
             total_loss += loss.item()
-        if sched is not None:
-            sched.step()
+        sched.step()
+        # Печатаем каждые 5 эпох, чтобы лог не разрастался
+        if ep % 5 == 0 or ep == epochs:
+            print(f"    эпоха {ep:>2}/{epochs} | loss = {total_loss/len(train_loader):.4f}")
 
     if device.type == 'cuda':
         torch.cuda.synchronize()
@@ -165,34 +180,48 @@ if __name__ == "__main__":
     if device.type == 'cuda':
         print(f"GPU: {torch.cuda.get_device_name(0)}")
 
-    # (имя, эпох, normalize, scheduler)
-    configs = [
-        ("1. Базовая (5 эпох)",              5,  False, False),
-        ("2. + Нормализация (5 эпох)",       5,  True,  False),
-        ("3. + Норм + Cosine (5 эпох)",      5,  True,  True),
-        ("4. + Норм + Cosine (15 эпох)",     15, True,  True),
+    # ---------- MNIST / FashionMNIST ----------
+    plans_mnist = [
+        ("A. 15 эп, без аугм, фикс",     15, False, False),
+        ("B. 25 эп, без аугм, фикс",     25, False, False),
+        ("C. 25 эп, +аугм,    фикс",     25, True,  False),
+        ("D. 25 эп, +аугм,    обуч. init", 25, True, True),
     ]
 
-    datasets_to_run = ["MNIST", "FashionMNIST"]
-
     summary = {}
-    for ds in datasets_to_run:
-        print(f"\n{'='*70}\nНАБОР: {ds}\n{'='*70}")
+
+    for ds in ["MNIST", "FashionMNIST"]:
+        print(f"\n{'='*72}\nНАБОР: {ds}\n{'='*72}")
         rows = []
-        for name, ep, norm, sched in configs:
-            print(f"\n>>> {name}")
-            acc, t = run_experiment(ds, epochs=ep, normalize=norm, use_scheduler=sched)
+        for label, ep, aug, tr in plans_mnist:
+            print(f"\n>>> {label}")
+            acc, t = run_experiment(ds, epochs=ep, augment=aug, trainable=tr)
             print(f"    Точность: {acc:.2f}%  |  Время: {t:.1f}с")
-            rows.append((name, acc, t))
+            rows.append((label, acc, t))
         summary[ds] = rows
 
-    # --- Итог ---
-    print("\n\n" + "=" * 78)
-    print("СВОДКА".center(78))
-    print("=" * 78)
-    for ds in datasets_to_run:
+    # ---------- CIFAR-10 ----------
+    plans_cifar = [
+        ("E. 25 эп, +аугм, фикс",       25, True, False),
+        ("F. 25 эп, +аугм, обуч. init", 25, True, True),
+    ]
+
+    print(f"\n{'='*72}\nНАБОР: CIFAR-10\n{'='*72}")
+    rows = []
+    for label, ep, aug, tr in plans_cifar:
+        print(f"\n>>> {label}")
+        acc, t = run_experiment("CIFAR10", epochs=ep, augment=aug, trainable=tr)
+        print(f"    Точность: {acc:.2f}%  |  Время: {t:.1f}с")
+        rows.append((label, acc, t))
+    summary["CIFAR10"] = rows
+
+    # ---------- Сводка ----------
+    print("\n\n" + "=" * 82)
+    print("СВОДКА".center(82))
+    print("=" * 82)
+    for ds in ["MNIST", "FashionMNIST", "CIFAR10"]:
         print(f"\n### {ds} ###")
         print(f"{'Конфигурация':<32}{'Точность':>12}{'Время':>10}")
         print("-" * 54)
-        for name, acc, t in summary[ds]:
-            print(f"{name:<32}{acc:>11.2f}%{t:>9.1f}с")
+        for label, acc, t in summary[ds]:
+            print(f"{label:<32}{acc:>11.2f}%{t:>9.1f}с")
