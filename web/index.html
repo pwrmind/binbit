@@ -1,0 +1,222 @@
+<!-- web/index.html -->
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<title>BasisNet в браузере</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 720px; margin: 40px auto;
+         padding: 0 20px; background: #0f172a; color: #e2e8f0; }
+  h1 { color: #38bdf8; }
+  .card { background: #1e293b; padding: 20px; border-radius: 12px; margin: 16px 0; }
+  button { background: #38bdf8; color: #0f172a; border: none;
+           padding: 10px 20px; border-radius: 8px; font-weight: 600;
+           cursor: pointer; margin: 4px; }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  .metric { display: flex; justify-content: space-between;
+            padding: 8px 0; border-bottom: 1px solid #334155; }
+  .metric:last-child { border-bottom: none; }
+  .metric span:last-child { font-weight: 600; color: #38bdf8; }
+  canvas { background: #000; border-radius: 8px; margin-top: 8px; }
+  .success { color: #4ade80; }
+  .fail { color: #f87171; }
+  .warn { color: #fbbf24; }
+  pre { background: #0f172a; padding: 12px; border-radius: 8px;
+        overflow-x: auto; font-size: 13px; color: #94a3b8; }
+</style>
+</head>
+<body>
+
+<h1>BasisNet: инференс в браузере</h1>
+<p>Замеряем реальные метрики: загрузка модели, время инференса, проверка точности.</p>
+
+<div class="card">
+  <h2>1. Загрузка модели</h2>
+  <button id="load-fp32">Загрузить fp32</button>
+  <button id="load-int8">Загрузить int8</button>
+  <div id="load-metrics"></div>
+</div>
+
+<div class="card">
+  <h2>2. Инференс</h2>
+  <button id="run-10" disabled>Прогнать 10 примеров</button>
+  <button id="run-100" disabled>Прогнать 100 примеров</button>
+  <div id="infer-metrics"></div>
+  <canvas id="preview" width="140" height="140"></canvas>
+</div>
+
+<div class="card">
+  <h2>3. Проверка точности</h2>
+  <div id="accuracy-check">Загрузите модель и эталон</div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.17.0/dist/ort.min.js"></script>
+<script>
+// ---- Состояние ----
+let session = null;
+let modelType = null;
+let reference = null;
+let loadTimeMs = 0;
+let modelSize = 0;
+
+// ---- Утилиты ----
+function log(id, html) {
+  document.getElementById(id).innerHTML = html;
+}
+
+function metricRow(label, value) {
+  return `<div class="metric"><span>${label}</span><span>${value}</span></div>`;
+}
+
+// ---- Загрузка модели ----
+async function loadModel(type) {
+  const path = type === 'int8' ? 'model_int8.onnx' : 'model.onnx';
+  log('load-metrics', 'Загрузка...');
+
+  const t0 = performance.now();
+  try {
+    const response = await fetch(path);
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: файл ${path} не найден. ` +
+                      `Запустите экспорт: python export_onnx.py`);
+    }
+    const buffer = await response.arrayBuffer();
+    modelSize = buffer.byteLength;
+    const tFetch = performance.now() - t0;
+
+    // Инициализация ONNX Runtime
+    ort.env.wasm.numThreads = navigator.hardwareConcurrency || 4;
+    ort.env.wasm.simd = true;
+
+    const tInit0 = performance.now();
+    session = await ort.InferenceSession.create(buffer, {
+      executionProviders: ['wasm'],
+      graphOptimizationLevel: 'all',
+    });
+    const tInit = performance.now() - tInit0;
+
+    loadTimeMs = performance.now() - t0;
+    modelType = type;
+
+    log('load-metrics',
+      metricRow('Размер модели', (modelSize / 1024).toFixed(1) + ' KB') +
+      metricRow('Скачивание (fetch)', tFetch.toFixed(0) + ' ms') +
+      metricRow('Инициализация сессии', tInit.toFixed(0) + ' ms') +
+      metricRow('Общее время загрузки', '<b>' + loadTimeMs.toFixed(0) + ' ms</b>')
+    );
+
+    document.getElementById('run-10').disabled = false;
+    document.getElementById('run-100').disabled = false;
+
+    // Загружаем эталон (один раз)
+    if (!reference) {
+      const r = await fetch('reference.json');
+      reference = await r.json();
+    }
+    checkAccuracy();
+  } catch (e) {
+    let hint = '';
+    if (e.message.includes('ConvInteger')) {
+      hint = '<br><span class="warn">Совет: int8-модель содержит ConvInteger, ' +
+             'который не поддерживается в WASM. Переквантуйте только Linear-слои ' +
+             'или используйте fp32-версию.</span>';
+    }
+    log('load-metrics',
+        '<span class="fail">Ошибка: ' + e.message + '</span>' + hint);
+  }
+}
+
+// ---- Инференс ----
+async function runInference(count) {
+  if (!session || !reference) return;
+  log('infer-metrics', 'Прогрев...');
+
+  const warmInput = new ort.Tensor('float32',
+    new Float32Array(reference.inputs[0]), [1, 1, 28, 28]);
+  await session.run({ input: warmInput });
+
+  const n = Math.min(count, reference.inputs.length);
+  const times = [];
+  let correct = 0;
+
+  for (let i = 0; i < n; i++) {
+    const inputData = new Float32Array(reference.inputs[i]);
+    const input = new ort.Tensor('float32', inputData, [1, 1, 28, 28]);
+
+    const t0 = performance.now();
+    const out = await session.run({ input });
+    times.push(performance.now() - t0);
+
+    const logits = out.logits.data;
+    let pred = 0;
+    for (let j = 1; j < logits.length; j++) {
+      if (logits[j] > logits[pred]) pred = j;
+    }
+    if (pred === reference.labels[i]) correct++;
+
+    if (i === 0) drawImage(inputData);
+  }
+
+  const avg = times.reduce((a, b) => a + b, 0) / times.length;
+  const min = Math.min(...times);
+  const max = Math.max(...times);
+
+  log('infer-metrics',
+    metricRow('Примеров прогнано', n) +
+    metricRow('Среднее время', '<b>' + avg.toFixed(2) + ' ms</b>') +
+    metricRow('Минимум', min.toFixed(2) + ' ms') +
+    metricRow('Максимум', max.toFixed(2) + ' ms') +
+    metricRow('Пропускная способность',
+              (1000 / avg).toFixed(1) + ' инф/сек')
+  );
+}
+
+function drawImage(data) {
+  const canvas = document.getElementById('preview');
+  const ctx = canvas.getContext('2d');
+  const size = 28;
+  const scale = canvas.width / size;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const v = Math.floor(data[y * size + x] * 255);
+      ctx.fillStyle = `rgb(${v},${v},${v})`;
+      ctx.fillRect(x * scale, y * scale, scale, scale);
+    }
+  }
+}
+
+// ---- Проверка точности против эталона PyTorch ----
+async function checkAccuracy() {
+  if (!session || !reference) return;
+  let matches = 0;
+  const n = reference.inputs.length;
+
+  for (let i = 0; i < n; i++) {
+    const input = new ort.Tensor('float32',
+      new Float32Array(reference.inputs[i]), [1, 1, 28, 28]);
+    const out = await session.run({ input });
+
+    const logits = out.logits.data;
+    let pred = 0;
+    for (let j = 1; j < logits.length; j++) {
+      if (logits[j] > logits[pred]) pred = j;
+    }
+    if (pred === reference.labels[i]) matches++;
+  }
+
+  const acc = (matches / n * 100).toFixed(0);
+  const cls = acc >= 90 ? 'success' : 'fail';
+  document.getElementById('accuracy-check').innerHTML =
+    `<span class="${cls}">Совпадение с PyTorch: ${matches}/${n} (${acc}%)</span>`;
+}
+
+// ---- Кнопки ----
+document.getElementById('load-fp32').onclick = () => loadModel('fp32');
+document.getElementById('load-int8').onclick = () => loadModel('int8');
+document.getElementById('run-10').onclick = () => runInference(10);
+document.getElementById('run-100').onclick = () => runInference(100);
+</script>
+
+</body>
+</html>
