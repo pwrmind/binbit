@@ -1,20 +1,17 @@
 """
-final_experiments.py
-====================
-Закрываем открытые вопросы:
+analyst_check.py
+================
+Проверяем гипотезы аналитика против нашей проверенной конфигурации.
 
-  Для MNIST и FashionMNIST:
-     A. 15 эпох, без аугментации, фикс. базис  (референс)
-     B. 25 эпох, без аугментации, фикс. базис
-     C. 25 эпох, +аугментация,    фикс. базис
-     D. 25 эпох, +аугментация,    обучаемый слой, инициализированный шаблонами
+Конфигурации:
+    1. Baseline              : 4 фикс + ReLU                  (референс)
+    2. +BN после fixed_conv  : Conv -> BN -> ReLU
+    3. +abs вместо ReLU      : Conv -> |x|
+    4. +норм. шаблоны /2     : 4 фикс/2 + ReLU
+    5. +LeakyReLU            : Conv -> LeakyReLU (0.1)
+    6. Всё сразу             : Conv/2 -> BN -> abs
 
-  Для CIFAR-10:
-     E. 25 эпох, +аугментация, фикс. базис (groups=3, 12 каналов)
-     F. 25 эпох, +аугментация, обучаемый слой (init шаблонами)
-
-Без нормализации — мы доказали, что она вредит базису.
-С CosineAnnealingLR везде.
+Всё без нормализации данных, 15 эпох, CosineAnnealingLR.
 """
 
 import warnings
@@ -29,7 +26,7 @@ import time
 
 
 # ============================================================
-# 1. ФИКСИРОВАННЫЙ БАЗИС
+# ШАБЛОНЫ (нормальный и нормализованный)
 # ============================================================
 
 TEMPLATES = torch.tensor([
@@ -39,25 +36,47 @@ TEMPLATES = torch.tensor([
     [[ 1, -1], [-1,  1]],
 ], dtype=torch.float32)
 
+TEMPLATES_NORM = TEMPLATES / 2.0
+
 
 # ============================================================
-# 2. МОДЕЛЬ
+# ГИБКАЯ МОДЕЛЬ
 # ============================================================
 
 class BasisNet(nn.Module):
-    def __init__(self, in_channels=1, num_classes=10, stride=2, trainable=False):
+    """
+    cfg:
+      templates   : тензор (4, 2, 2)
+      use_bn      : BatchNorm после fixed_conv
+      activation  : 'relu' | 'abs' | 'leaky'
+    """
+    def __init__(self, in_channels=1, num_classes=10, stride=2,
+                 templates=TEMPLATES, use_bn=False, activation='relu'):
         super().__init__()
         groups = in_channels if in_channels > 1 else 1
-        self.out_ch = 4 * groups
+        out_ch = 4 * groups
 
-        self.fixed_conv = nn.Conv2d(in_channels, self.out_ch, 2, stride=stride,
+        self.fixed_conv = nn.Conv2d(in_channels, out_ch, 2, stride=stride,
                                     padding=0, bias=False, groups=groups)
-        w = TEMPLATES.unsqueeze(1).repeat(groups, 1, 1, 1)
-        self.fixed_conv.weight = nn.Parameter(w, requires_grad=trainable)
+        w = templates.unsqueeze(1).repeat(groups, 1, 1, 1)
+        self.fixed_conv.weight = nn.Parameter(w, requires_grad=False)
 
-        self.act = nn.ReLU()
+        self.use_bn = use_bn
+        if use_bn:
+            self.bn = nn.BatchNorm2d(out_ch)
+
+        self.activation = activation
+        if activation == 'relu':
+            self.act = nn.ReLU()
+        elif activation == 'leaky':
+            self.act = nn.LeakyReLU(0.1)
+        elif activation == 'abs':
+            self.act = None  # обрабатываем в forward
+        else:
+            raise ValueError(activation)
+
         self.features = nn.Sequential(
-            nn.Conv2d(self.out_ch, 64, 3, padding=1),
+            nn.Conv2d(out_ch, 64, 3, padding=1),
             nn.BatchNorm2d(64), nn.ReLU(), nn.MaxPool2d(2),
             nn.Conv2d(64, 128, 3, padding=1),
             nn.BatchNorm2d(128), nn.ReLU(), nn.MaxPool2d(2),
@@ -66,73 +85,60 @@ class BasisNet(nn.Module):
         self.classifier = nn.Linear(128, num_classes)
 
     def forward(self, x):
-        x = self.act(self.fixed_conv(x))
+        x = self.fixed_conv(x)
+        if self.use_bn:
+            x = self.bn(x)
+        if self.activation == 'abs':
+            x = torch.abs(x)
+        else:
+            x = self.act(x)
         x = self.features(x)
         return self.classifier(torch.flatten(x, 1))
 
 
 # ============================================================
-# 3. ДАННЫЕ + АУГМЕНТАЦИЯ
+# ДАННЫЕ
 # ============================================================
 
-def get_transforms(dataset_name, augment):
-    if dataset_name == "CIFAR10":
-        base = [transforms.ToTensor()]
-        if augment:
-            base = [
-                transforms.RandomCrop(32, padding=4),
-                transforms.RandomHorizontalFlip(),
-                transforms.ToTensor(),
-            ]
-        return transforms.Compose(base)
-
-    # MNIST / FashionMNIST
-    if augment:
-        return transforms.Compose([
-            transforms.RandomAffine(degrees=0, translate=(0.05, 0.05)),
-            transforms.ToTensor(),
-        ])
-    return transforms.Compose([transforms.ToTensor()])
-
-
-def get_loaders(dataset_name, augment, batch_size=128):
-    tf_train = get_transforms(dataset_name, augment=augment)
-    tf_test  = transforms.Compose([transforms.ToTensor()])
-
+def get_loaders(dataset_name, batch_size=128):
+    tf = transforms.Compose([transforms.ToTensor()])
     if dataset_name == "MNIST":
-        cls, root, in_ch = datasets.MNIST, "./data", 1
+        cls, root = datasets.MNIST, "./data"
     elif dataset_name == "FashionMNIST":
-        cls, root, in_ch = datasets.FashionMNIST, "./data", 1
-    elif dataset_name == "CIFAR10":
-        cls, root, in_ch = datasets.CIFAR10, "./data_cifar", 3
+        cls, root = datasets.FashionMNIST, "./data"
     else:
         raise ValueError(dataset_name)
 
-    train_ds = cls(root=root, train=True,  download=True, transform=tf_train)
-    test_ds  = cls(root=root, train=False, download=True, transform=tf_test)
+    train_ds = cls(root=root, train=True,  download=True, transform=tf)
+    test_ds  = cls(root=root, train=False, download=True, transform=tf)
 
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
                               num_workers=2, pin_memory=True)
     test_loader  = DataLoader(test_ds,  batch_size=1000, shuffle=False,
                               num_workers=2, pin_memory=True)
-    return train_loader, test_loader, in_ch
+    return train_loader, test_loader
 
 
 # ============================================================
-# 4. ОБУЧЕНИЕ
+# ОБУЧЕНИЕ
 # ============================================================
 
-def run_experiment(dataset_name, epochs, augment, trainable, lr=1e-3, seed=42):
+def run(dataset_name, cfg, epochs=15, lr=1e-3, seed=42):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    train_loader, test_loader, in_ch = get_loaders(dataset_name, augment=augment)
-    model = BasisNet(in_channels=in_ch, trainable=trainable).to(device)
+    train_loader, test_loader = get_loaders(dataset_name)
+    model = BasisNet(
+        in_channels=1,
+        templates=cfg["templates"],
+        use_bn=cfg["use_bn"],
+        activation=cfg["activation"],
+    ).to(device)
 
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
-    opt = optim.Adam(trainable_params, lr=lr)
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    opt = optim.Adam(trainable, lr=lr)
     sched = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
     crit = nn.CrossEntropyLoss()
 
@@ -151,9 +157,6 @@ def run_experiment(dataset_name, epochs, augment, trainable, lr=1e-3, seed=42):
             opt.step()
             total_loss += loss.item()
         sched.step()
-        # Печатаем каждые 5 эпох, чтобы лог не разрастался
-        if ep % 5 == 0 or ep == epochs:
-            print(f"    эпоха {ep:>2}/{epochs} | loss = {total_loss/len(train_loader):.4f}")
 
     if device.type == 'cuda':
         torch.cuda.synchronize()
@@ -171,7 +174,7 @@ def run_experiment(dataset_name, epochs, augment, trainable, lr=1e-3, seed=42):
 
 
 # ============================================================
-# 5. ЗАПУСК
+# ЗАПУСК
 # ============================================================
 
 if __name__ == "__main__":
@@ -180,48 +183,41 @@ if __name__ == "__main__":
     if device.type == 'cuda':
         print(f"GPU: {torch.cuda.get_device_name(0)}")
 
-    # ---------- MNIST / FashionMNIST ----------
-    plans_mnist = [
-        ("A. 15 эп, без аугм, фикс",     15, False, False),
-        ("B. 25 эп, без аугм, фикс",     25, False, False),
-        ("C. 25 эп, +аугм,    фикс",     25, True,  False),
-        ("D. 25 эп, +аугм,    обуч. init", 25, True, True),
+    configs = [
+        ("1. Baseline (ReLU, шаблоны 1/-1)",
+            dict(templates=TEMPLATES,      use_bn=False, activation='relu')),
+        ("2. +BN после fixed_conv",
+            dict(templates=TEMPLATES,      use_bn=True,  activation='relu')),
+        ("3. +abs вместо ReLU",
+            dict(templates=TEMPLATES,      use_bn=False, activation='abs')),
+        ("4. +шаблоны /2",
+            dict(templates=TEMPLATES_NORM, use_bn=False, activation='relu')),
+        ("5. +LeakyReLU (0.1)",
+            dict(templates=TEMPLATES,      use_bn=False, activation='leaky')),
+        ("6. Всё сразу: /2 + BN + abs",
+            dict(templates=TEMPLATES_NORM, use_bn=True,  activation='abs')),
     ]
 
+    datasets_to_run = ["MNIST", "FashionMNIST"]
     summary = {}
 
-    for ds in ["MNIST", "FashionMNIST"]:
-        print(f"\n{'='*72}\nНАБОР: {ds}\n{'='*72}")
+    for ds in datasets_to_run:
+        print(f"\n{'='*78}\nНАБОР: {ds}  (15 эпох, Cosine, без нормализации данных)\n{'='*78}")
         rows = []
-        for label, ep, aug, tr in plans_mnist:
+        for label, cfg in configs:
             print(f"\n>>> {label}")
-            acc, t = run_experiment(ds, epochs=ep, augment=aug, trainable=tr)
+            acc, t = run(ds, cfg=cfg, epochs=15)
             print(f"    Точность: {acc:.2f}%  |  Время: {t:.1f}с")
             rows.append((label, acc, t))
         summary[ds] = rows
 
-    # ---------- CIFAR-10 ----------
-    plans_cifar = [
-        ("E. 25 эп, +аугм, фикс",       25, True, False),
-        ("F. 25 эп, +аугм, обуч. init", 25, True, True),
-    ]
-
-    print(f"\n{'='*72}\nНАБОР: CIFAR-10\n{'='*72}")
-    rows = []
-    for label, ep, aug, tr in plans_cifar:
-        print(f"\n>>> {label}")
-        acc, t = run_experiment("CIFAR10", epochs=ep, augment=aug, trainable=tr)
-        print(f"    Точность: {acc:.2f}%  |  Время: {t:.1f}с")
-        rows.append((label, acc, t))
-    summary["CIFAR10"] = rows
-
-    # ---------- Сводка ----------
+    # --- Сводка ---
     print("\n\n" + "=" * 82)
     print("СВОДКА".center(82))
     print("=" * 82)
-    for ds in ["MNIST", "FashionMNIST", "CIFAR10"]:
+    for ds in datasets_to_run:
         print(f"\n### {ds} ###")
-        print(f"{'Конфигурация':<32}{'Точность':>12}{'Время':>10}")
-        print("-" * 54)
+        print(f"{'Конфигурация':<42}{'Точность':>12}{'Время':>10}")
+        print("-" * 64)
         for label, acc, t in summary[ds]:
-            print(f"{label:<32}{acc:>11.2f}%{t:>9.1f}с")
+            print(f"{label:<42}{acc:>11.2f}%{t:>9.1f}с")
